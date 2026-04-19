@@ -1,207 +1,398 @@
 /***************************************************************
- * Two-State Orbit + Push-Out (No Text Labels)
- * 
- * In State 1: All 6 orbit in ascending order [1,2,3,4,5,6].
- * Clicking one -> it becomes center, ring goes to 5 circles.
+ * Lava Lamp Blob Simulator
  *
- * In State 2: A "center circle" + 5 orbiting circles.
- * - Clicking the center circle -> it re-inserts itself back into 
- *   the ring in sorted order, returning to State 1.
- * - Clicking a ring circle -> that circle becomes center, pushing
- *   the old center onto the ring "opposite" the new center.
- *
- * Over time the ring can get out of ascending order, but 
- * whenever you re-click the center circle, the ring is re-sorted.
+ * Dark-mode, ambient, mobile-first. Blobs fall slowly in the
+ * direction of phone tilt (DeviceOrientation), fuse and morph
+ * on contact (WebGL metaball shader), and respond to touch by
+ * carving a soft repulsive hole.
  ***************************************************************/
 
-// ---------------- CONFIG ----------------
-const CIRCLE_IDS    = [1, 2, 3, 4, 5, 6];       // fixed IDs, used internally
-const COLORS        = ["#00BFA6", "#7C4DFF", "#FF5252", "#FFC400", "#448AFF", "#FF4081"];
-const DARK_BG       = "#2C2C2C";                // dark-gray background
+const MAX_BLOBS   = 12;
+const MAX_HOLES   = 4;
+const START_BLOBS = 8;
 
-// Sizes for state 1 (no center)
-const NORMAL_RADIUS = 180;   // ring distance
-const NORMAL_SIZE   = 120;   // diameter of circles
+const GRAVITY_SCALE    = 0.18;
+const GRAVITY_SMOOTH   = 0.08;
+const DAMPING          = 0.965;
+const WALL_BOUNCE      = 0.55;
 
-// Sizes for state 2 (one center)
-const ORBIT_RADIUS  = 260;   // ring distance when 5 remain
-const CENTER_SIZE   = 260;   // center circle diameter
-const RING_SIZE     = 90;    // orbiting circle diameter
+const MIN_R            = 55;
+const MAX_R            = 180;
+const MERGE_OVERLAP    = 0.55;
 
-// Animation speeds
-const ORBIT_SPEED   = 0.002; // how fast the ring rotates
-const EASING_SPEED  = 0.1;   // how quickly circles move/resize to targets
+const HOLE_RADIUS      = 95;
+const HOLE_STRENGTH    = 1.35;
+const HOLE_PUSH        = 0.45;
+const HOLE_PUSH_REACH  = HOLE_RADIUS * 1.8;
 
-// ---------------- GLOBALS ----------------
-let circleData       = [];   // info about each circle: {id, color, curX, curY, ...}
-let ringArrangement  = [];   // which circle IDs are on the ring (in some order)
-let centerCircleId   = -1;   // which circle ID is in center? -1 => none
-let globalAngle      = 0;    // ring's rotation angle
+const METABALL_LO      = 0.95;
+const METABALL_HI      = 1.15;
 
+const PALETTE = [
+  [0.247, 0.714, 0.659],  // #3FB6A8 muted teal
+  [0.769, 0.314, 0.557],  // #C4508E magenta
+  [0.847, 0.604, 0.290],  // #D89A4A amber
+  [0.498, 0.373, 0.780],  // #7F5FC7 violet
+  [0.290, 0.435, 0.690],  // #4A6FB0 indigo
+  [0.878, 0.412, 0.482],  // #E0697B coral
+];
+
+// ---------------- STATE ----------------
+let blobs = [];
+let holes = [];
+let metaShader;
+let tiltGravity = { x: 0, y: 0 };      // smoothed gravity direction
+let rawGravity  = { x: 0, y: 1 };      // raw input (defaults to "down")
+let useSensor   = false;
+let startTime   = 0;
+
+// ---------------- SHADERS ----------------
+const VERT_SRC = `
+precision highp float;
+attribute vec3 aPosition;
+attribute vec2 aTexCoord;
+varying vec2 vTexCoord;
+void main() {
+  vTexCoord = aTexCoord;
+  vec4 pos = vec4(aPosition, 1.0);
+  pos.xy = pos.xy * 2.0 - 1.0;
+  gl_Position = pos;
+}
+`;
+
+const FRAG_SRC = `
+precision highp float;
+
+#define MAX_BLOBS 12
+#define MAX_HOLES 4
+
+uniform vec2  uResolution;
+uniform int   uBlobCount;
+uniform vec4  uBlobs[MAX_BLOBS];   // xy=pos, z=radius, w=unused
+uniform vec3  uColors[MAX_BLOBS];  // rgb
+uniform int   uHoleCount;
+uniform vec3  uHoles[MAX_HOLES];   // xy=pos, z=radius
+uniform float uHoleStrength;
+uniform float uTime;
+
+varying vec2 vTexCoord;
+
+void main() {
+  // vTexCoord is [0,1]; flip Y so (0,0) is top-left in pixels
+  vec2 p = vec2(vTexCoord.x, 1.0 - vTexCoord.y) * uResolution;
+
+  float F = 0.0;
+  vec3  accumColor = vec3(0.0);
+  float weightSum  = 0.0;
+
+  for (int i = 0; i < MAX_BLOBS; i++) {
+    if (i >= uBlobCount) break;
+    vec2  bp = uBlobs[i].xy;
+    float br = uBlobs[i].z;
+    vec2  d  = p - bp;
+    float dd = dot(d, d) + 1.0;
+    float contrib = (br * br) / dd;
+    F          += contrib;
+    accumColor += uColors[i] * contrib;
+    weightSum  += contrib;
+  }
+
+  for (int j = 0; j < MAX_HOLES; j++) {
+    if (j >= uHoleCount) break;
+    vec2  hp = uHoles[j].xy;
+    float hr = uHoles[j].z;
+    vec2  d  = p - hp;
+    float dd = dot(d, d) + 1.0;
+    F -= uHoleStrength * (hr * hr) / dd;
+  }
+
+  vec3 color = (weightSum > 0.0) ? (accumColor / weightSum) : vec3(0.4);
+
+  // slow ambient color drift
+  float t = uTime;
+  vec3 drift = vec3(
+    0.5 + 0.5 * sin(t * 0.30),
+    0.5 + 0.5 * sin(t * 0.27 + 2.0),
+    0.5 + 0.5 * sin(t * 0.23 + 4.0)
+  );
+  color = mix(color, color * (0.85 + 0.35 * drift), 0.22);
+
+  // gooey isosurface
+  float mask = smoothstep(${METABALL_LO.toFixed(3)}, ${METABALL_HI.toFixed(3)}, F);
+
+  // interior rim lift (brighter toward thick core)
+  float core = smoothstep(1.15, 1.8, F);
+  vec3  surf = mix(color * 0.55, color * 1.12, core);
+
+  // soft glow just outside the isosurface
+  float glow = smoothstep(0.35, ${METABALL_LO.toFixed(3)}, F) * (1.0 - mask);
+
+  vec3 bg = vec3(0.020, 0.023, 0.043);
+  vec3 outColor = mix(bg, surf, mask) + 0.22 * glow * color;
+
+  // vignette
+  vec2 q = vTexCoord - 0.5;
+  float vig = smoothstep(0.85, 0.25, length(q));
+  outColor *= mix(0.80, 1.0, vig);
+
+  // gamma
+  outColor = pow(outColor, vec3(0.95));
+
+  gl_FragColor = vec4(outColor, 1.0);
+}
+`;
+
+// ---------------- p5 HOOKS ----------------
 function setup() {
-  createCanvas(windowWidth, windowHeight);
+  const c = createCanvas(windowWidth, windowHeight, WEBGL);
+  c.elt.style.display  = 'block';
+  c.elt.style.position = 'absolute';
+  c.elt.style.top      = '0';
+  c.elt.style.left     = '0';
+  pixelDensity(1);
   noStroke();
 
-  // Remove default browser margins
-  const c = canvas;
-  c.style.display  = "block";
-  c.style.margin   = "0";
-  c.style.padding  = "0";
-  c.style.position = "absolute";
-  c.style.top      = "0";
-  c.style.left     = "0";
+  metaShader = createShader(VERT_SRC, FRAG_SRC);
+  startTime  = millis();
 
-  // Create circle objects for IDs 1..6
-  for (let i = 0; i < CIRCLE_IDS.length; i++) {
-    circleData.push({
-      id:    CIRCLE_IDS[i],
-      color: color(COLORS[i]),
-      // We’ll animate curX/Y/Size toward targetX/Y/Size
-      curX:      0,
-      curY:      0,
-      curSize:   NORMAL_SIZE,
-      targetX:   0,
-      targetY:   0,
-      targetSize: NORMAL_SIZE
-    });
-  }
-
-  // Start in State 1: ringArrangement has all IDs in ascending order
-  ringArrangement = [...CIRCLE_IDS]; // copy array
-
-  // Position them so they don’t appear from a corner
-  placeRing(ringArrangement, NORMAL_RADIUS, NORMAL_SIZE);
-  for (let c of circleData) {
-    c.curX    = c.targetX;
-    c.curY    = c.targetY;
-    c.curSize = c.targetSize;
-  }
+  spawnInitialBlobs();
+  initMotion();
 }
 
 function draw() {
-  background(DARK_BG);
+  clear();
 
-  // Rotate the ring gently
-  globalAngle += ORBIT_SPEED;
+  const dt = Math.min(deltaTime / 16.667, 2.0); // cap dt in case of hitches
+  updateHoles();
+  updateGravity();
+  stepPhysics(dt);
+  mergeBlobs();
 
-  if (centerCircleId === -1) {
-    // ---------- STATE 1: No Center ----------
-    placeRing(ringArrangement, NORMAL_RADIUS, NORMAL_SIZE);
-  } else {
-    // ---------- STATE 2: One Circle in Center ----------
-    // The ringArrangement has the 5 orbiting circles
-    placeRing(ringArrangement, ORBIT_RADIUS, RING_SIZE);
-
-    // The center circle is enlarged and placed in the middle
-    let c = getCircleData(centerCircleId);
-    c.targetX    = width / 2;
-    c.targetY    = height / 2;
-    c.targetSize = CENTER_SIZE;
-  }
-
-  // Smoothly animate circles to their targets
-  for (let c of circleData) {
-    c.curX    += (c.targetX    - c.curX)    * EASING_SPEED;
-    c.curY    += (c.targetY    - c.curY)    * EASING_SPEED;
-    c.curSize += (c.targetSize - c.curSize) * EASING_SPEED;
-
-    fill(c.color);
-    ellipse(c.curX, c.curY, c.curSize, c.curSize);
-  }
-}
-
-// Arrange the array of circle IDs around the ring at a given radius
-function placeRing(ids, radius, size) {
-  let count = ids.length;
-  if (count === 0) return;
-  let step = TWO_PI / count;
-  for (let i = 0; i < count; i++) {
-    let id = ids[i];
-    let obj  = getCircleData(id);
-    let angle = globalAngle + step * i;
-    let x = width / 2 + cos(angle) * radius;
-    let y = height / 2 + sin(angle) * radius;
-
-    obj.targetX    = x;
-    obj.targetY    = y;
-    obj.targetSize = size;
-  }
-}
-
-function mousePressed() {
-  let clickedId = findCircleUnderMouse();
-  
-  // Clicked empty space => if we had a center, revert to normal
-  if (clickedId === -1) {
-    if (centerCircleId !== -1) {
-      insertIdSorted(centerCircleId, ringArrangement);
-      centerCircleId = -1;
-    }
-    return;
-  }
-
-  // If user clicked the circle already in center => revert to normal
-  if (clickedId === centerCircleId) {
-    insertIdSorted(centerCircleId, ringArrangement);
-    centerCircleId = -1;
-    return;
-  }
-
-  // Otherwise, the user clicked a ring circle => newCenter
-  let newCenterId = clickedId;
-  let oldCenterId = centerCircleId;
-
-  if (oldCenterId === -1) {
-    // If we’re in State 1, just remove newCenter from ring and put it center
-    removeId(newCenterId, ringArrangement);
-    centerCircleId = newCenterId;
-    return;
-  }
-
-  // If we're in State 2: push oldCenter to "opposite" newCenter's position
-  let pos = ringArrangement.indexOf(newCenterId);
-  if (pos === -1) return; // should never happen unless something’s off
-
-  let len = ringArrangement.length; // typically 5
-  let opposite = (pos + Math.floor(len/2)) % len;
-
-  // Insert the old center at 'opposite'
-  ringArrangement.splice(opposite, 0, oldCenterId);
-  // Remove newCenter from ring
-  removeId(newCenterId, ringArrangement);
-  // newCenter is now the center
-  centerCircleId = newCenterId;
-}
-
-// Helper: remove a given ID from an array (if present)
-function removeId(id, arr) {
-  let i = arr.indexOf(id);
-  if (i !== -1) arr.splice(i, 1);
-}
-
-// Helper: insert a given ID into an array so that it remains sorted
-function insertIdSorted(id, arr) {
-  arr.push(id);
-  arr.sort((a,b) => a - b);
-}
-
-// Return the circle object for a given ID
-function getCircleData(id) {
-  return circleData.find(obj => obj.id === id);
-}
-
-// Check which circle (if any) is under the mouse
-function findCircleUnderMouse() {
-  for (let i = 0; i < circleData.length; i++) {
-    let c = circleData[i];
-    let d = dist(mouseX, mouseY, c.curX, c.curY);
-    if (d < c.curSize / 2) {
-      return c.id; 
-    }
-  }
-  return -1;
+  renderBlobs();
 }
 
 function windowResized() {
   resizeCanvas(windowWidth, windowHeight);
+}
+
+// ---------------- INIT ----------------
+function spawnInitialBlobs() {
+  blobs = [];
+  for (let i = 0; i < START_BLOBS; i++) {
+    blobs.push(makeBlob(
+      random(width * 0.15, width * 0.85),
+      random(height * 0.15, height * 0.85),
+      random(MIN_R, MIN_R + 45),
+      i % PALETTE.length
+    ));
+  }
+}
+
+function makeBlob(x, y, r, paletteIdx) {
+  const c = PALETTE[paletteIdx % PALETTE.length];
+  return {
+    x, y,
+    vx: random(-0.4, 0.4),
+    vy: random(-0.4, 0.4),
+    r,
+    color: [c[0], c[1], c[2]],
+  };
+}
+
+// ---------------- MOTION / GRAVITY ----------------
+function initMotion() {
+  const gate = document.getElementById('motion-gate');
+  const btn  = document.getElementById('motion-btn');
+
+  const attachListener = () => {
+    window.addEventListener('deviceorientation', handleOrientation);
+  };
+
+  if (typeof DeviceOrientationEvent !== 'undefined' &&
+      typeof DeviceOrientationEvent.requestPermission === 'function') {
+    // iOS 13+ requires an explicit user gesture
+    if (gate) gate.classList.add('visible');
+    if (btn) {
+      btn.addEventListener('click', async () => {
+        try {
+          const res = await DeviceOrientationEvent.requestPermission();
+          if (res === 'granted') attachListener();
+        } catch (_) { /* ignore — fall through to desktop-style gravity */ }
+        if (gate) gate.classList.remove('visible');
+      }, { once: true });
+    }
+  } else if (typeof window.DeviceOrientationEvent !== 'undefined') {
+    attachListener();
+  }
+}
+
+function handleOrientation(e) {
+  // gamma: left/right tilt (-90..90). beta: front/back tilt (-180..180).
+  if (e.gamma == null || e.beta == null) return;
+  // Landscape vs portrait: use screen.orientation if available
+  const angle = (screen && screen.orientation && typeof screen.orientation.angle === 'number')
+    ? screen.orientation.angle : 0;
+  let gx, gy;
+  if (angle === 90) {
+    gx = e.beta / 45;
+    gy = -e.gamma / 45;
+  } else if (angle === -90 || angle === 270) {
+    gx = -e.beta / 45;
+    gy = e.gamma / 45;
+  } else if (angle === 180) {
+    gx = -e.gamma / 45;
+    gy = -e.beta / 45;
+  } else {
+    gx = e.gamma / 45;
+    gy = e.beta / 45;
+  }
+  rawGravity.x = constrain(gx, -1.8, 1.8);
+  rawGravity.y = constrain(gy, -1.8, 1.8);
+  useSensor = true; // only flip once a real orientation event arrives
+}
+
+function updateGravity() {
+  if (!useSensor) {
+    // Desktop fallback: cursor offset from screen center acts as tilt when
+    // pressed; otherwise a gentle downward pull so blobs still settle.
+    let tx = 0, ty = 1.0;
+    if (mouseIsPressed) {
+      tx = ((mouseX / width)  - 0.5) * 3.0;
+      ty = ((mouseY / height) - 0.5) * 3.0;
+    }
+    rawGravity.x = tx;
+    rawGravity.y = ty;
+  }
+  tiltGravity.x += (rawGravity.x - tiltGravity.x) * GRAVITY_SMOOTH;
+  tiltGravity.y += (rawGravity.y - tiltGravity.y) * GRAVITY_SMOOTH;
+}
+
+// ---------------- TOUCH / HOLES ----------------
+function updateHoles() {
+  holes = [];
+  if (touches && touches.length > 0) {
+    for (let i = 0; i < touches.length && holes.length < MAX_HOLES; i++) {
+      const t = touches[i];
+      holes.push({ x: t.x, y: t.y, r: HOLE_RADIUS });
+    }
+  } else if (mouseIsPressed) {
+    holes.push({ x: mouseX, y: mouseY, r: HOLE_RADIUS });
+  }
+}
+
+function touchStarted() { return false; }
+function touchMoved()   { return false; }
+
+// ---------------- PHYSICS ----------------
+function stepPhysics(dt) {
+  const gx = tiltGravity.x * GRAVITY_SCALE;
+  const gy = tiltGravity.y * GRAVITY_SCALE;
+
+  for (const b of blobs) {
+    b.vx += gx * dt;
+    b.vy += gy * dt;
+
+    // Hole repulsion pushes blob centers outward from each touch.
+    for (const h of holes) {
+      const dx = b.x - h.x;
+      const dy = b.y - h.y;
+      const dist = Math.sqrt(dx * dx + dy * dy) + 0.001;
+      if (dist < HOLE_PUSH_REACH) {
+        const falloff = 1.0 - dist / HOLE_PUSH_REACH;
+        const f = HOLE_PUSH * falloff * falloff;
+        b.vx += (dx / dist) * f;
+        b.vy += (dy / dist) * f;
+      }
+    }
+
+    b.vx *= Math.pow(DAMPING, dt);
+    b.vy *= Math.pow(DAMPING, dt);
+
+    b.x += b.vx * dt;
+    b.y += b.vy * dt;
+
+    // Soft walls
+    const pad = b.r * 0.35;
+    if (b.x < pad)            { b.x = pad;            b.vx = Math.abs(b.vx) * WALL_BOUNCE; }
+    if (b.x > width - pad)    { b.x = width - pad;    b.vx = -Math.abs(b.vx) * WALL_BOUNCE; }
+    if (b.y < pad)            { b.y = pad;            b.vy = Math.abs(b.vy) * WALL_BOUNCE; }
+    if (b.y > height - pad)   { b.y = height - pad;   b.vy = -Math.abs(b.vy) * WALL_BOUNCE; }
+  }
+}
+
+function mergeBlobs() {
+  for (let i = 0; i < blobs.length; i++) {
+    for (let j = i + 1; j < blobs.length; j++) {
+      const a = blobs[i];
+      const b = blobs[j];
+      const dx = b.x - a.x;
+      const dy = b.y - a.y;
+      const d  = Math.sqrt(dx * dx + dy * dy);
+      const minR = Math.min(a.r, b.r);
+      if (d < (a.r + b.r) - minR * MERGE_OVERLAP) {
+        const areaA = a.r * a.r;
+        const areaB = b.r * b.r;
+        const newR  = Math.sqrt(areaA + areaB);
+        if (newR > MAX_R) continue; // skip merge that would exceed cap
+
+        const totalA = areaA + areaB;
+        const nx = (a.x * areaA + b.x * areaB) / totalA;
+        const ny = (a.y * areaA + b.y * areaB) / totalA;
+        const nvx = (a.vx * areaA + b.vx * areaB) / totalA;
+        const nvy = (a.vy * areaA + b.vy * areaB) / totalA;
+
+        const nc = [
+          (a.color[0] * areaA + b.color[0] * areaB) / totalA,
+          (a.color[1] * areaA + b.color[1] * areaB) / totalA,
+          (a.color[2] * areaA + b.color[2] * areaB) / totalA,
+        ];
+
+        a.x = nx; a.y = ny;
+        a.vx = nvx; a.vy = nvy;
+        a.r = newR;
+        a.color = nc;
+
+        blobs.splice(j, 1);
+        j--;
+      }
+    }
+  }
+}
+
+// ---------------- RENDER ----------------
+function renderBlobs() {
+  const count = Math.min(blobs.length, MAX_BLOBS);
+
+  const blobBuf  = new Array(MAX_BLOBS * 4).fill(0);
+  const colorBuf = new Array(MAX_BLOBS * 3).fill(0);
+  for (let i = 0; i < count; i++) {
+    const b = blobs[i];
+    blobBuf[i * 4 + 0] = b.x;
+    blobBuf[i * 4 + 1] = b.y;
+    blobBuf[i * 4 + 2] = b.r;
+    blobBuf[i * 4 + 3] = 0;
+    colorBuf[i * 3 + 0] = b.color[0];
+    colorBuf[i * 3 + 1] = b.color[1];
+    colorBuf[i * 3 + 2] = b.color[2];
+  }
+
+  const holeCount = Math.min(holes.length, MAX_HOLES);
+  const holeBuf = new Array(MAX_HOLES * 3).fill(0);
+  for (let i = 0; i < holeCount; i++) {
+    holeBuf[i * 3 + 0] = holes[i].x;
+    holeBuf[i * 3 + 1] = holes[i].y;
+    holeBuf[i * 3 + 2] = holes[i].r;
+  }
+
+  shader(metaShader);
+  metaShader.setUniform('uResolution',   [width, height]);
+  metaShader.setUniform('uBlobCount',    count);
+  metaShader.setUniform('uBlobs',        blobBuf);
+  metaShader.setUniform('uColors',       colorBuf);
+  metaShader.setUniform('uHoleCount',    holeCount);
+  metaShader.setUniform('uHoles',        holeBuf);
+  metaShader.setUniform('uHoleStrength', HOLE_STRENGTH);
+  metaShader.setUniform('uTime',         (millis() - startTime) / 1000);
+
+  rect(0, 0, width, height);
 }
