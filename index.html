@@ -1,53 +1,91 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-  <meta name="viewport"
-        content="width=device-width, initial-scale=1.0, user-scalable=no, viewport-fit=cover" />
   <meta charset="utf-8" />
+  <meta name="viewport"
+        content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
   <meta name="theme-color" content="#05060B" />
-  <title>Lava Lamp</title>
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <title>Lava</title>
   <style>
+    :root {
+      --bg: #05060B;
+      --fg: #d9dae2;
+      --muted: #7c7f8c;
+    }
     html, body {
       margin: 0;
       padding: 0;
-      background: #05060B;
-      color: #cfd0d6;
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      height: 100%;
+      background: var(--bg);
+      color: var(--fg);
+      font-family: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", sans-serif;
       overflow: hidden;
       overscroll-behavior: none;
       touch-action: none;
-      height: 100%;
+      -webkit-user-select: none;
+      user-select: none;
+      -webkit-tap-highlight-color: transparent;
     }
     canvas { display: block; }
+
+    /* iOS motion-permission gate */
     #motion-gate {
       position: fixed;
       inset: 0;
       display: none;
       align-items: center;
       justify-content: center;
-      background: radial-gradient(circle at 50% 50%, #0c0d16 0%, #05060B 70%);
-      z-index: 10;
+      background: radial-gradient(ellipse at center, #0d0f1a 0%, #05060B 70%);
+      z-index: 20;
+      padding: calc(env(safe-area-inset-top, 0) + 20px)
+               calc(env(safe-area-inset-right, 0) + 20px)
+               calc(env(safe-area-inset-bottom, 0) + 20px)
+               calc(env(safe-area-inset-left, 0) + 20px);
     }
     #motion-gate.visible { display: flex; }
-    #motion-gate button {
-      background: rgba(255,255,255,0.06);
-      border: 1px solid rgba(255,255,255,0.15);
-      color: #e8e8ee;
-      padding: 14px 22px;
+    #motion-gate .inner { text-align: center; }
+    #motion-btn {
+      background: rgba(255,255,255,0.05);
+      border: 1px solid rgba(255,255,255,0.12);
+      color: var(--fg);
+      padding: 15px 26px;
       font-size: 15px;
-      letter-spacing: 0.04em;
+      font-weight: 500;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
       border-radius: 999px;
-      backdrop-filter: blur(8px);
-      -webkit-backdrop-filter: blur(8px);
+      backdrop-filter: blur(10px);
+      -webkit-backdrop-filter: blur(10px);
+      cursor: pointer;
+      transition: background 0.2s;
     }
+    #motion-btn:active { background: rgba(255,255,255,0.1); }
     #motion-gate small {
       display: block;
-      margin-top: 14px;
-      opacity: 0.55;
+      margin-top: 18px;
+      color: var(--muted);
       font-size: 12px;
-      text-align: center;
+      letter-spacing: 0.04em;
     }
-    #motion-gate .inner { text-align: center; padding: 20px; }
+
+    /* First-run hint overlay */
+    #hint {
+      position: fixed;
+      left: 0; right: 0;
+      bottom: calc(env(safe-area-inset-bottom, 0) + 24px);
+      text-align: center;
+      font-size: 11px;
+      letter-spacing: 0.14em;
+      text-transform: uppercase;
+      color: rgba(217, 218, 226, 0.42);
+      pointer-events: none;
+      z-index: 5;
+      opacity: 1;
+      transition: opacity 1.2s ease;
+    }
+    #hint.hidden { opacity: 0; }
   </style>
   <script src="https://cdn.jsdelivr.net/npm/p5@1.9.4/lib/p5.js"></script>
   <script src="sketch.js" defer></script>
@@ -56,8 +94,9 @@
   <div id="motion-gate">
     <div class="inner">
       <button id="motion-btn">Enable motion</button>
-      <small>Tilt your phone to steer the blobs</small>
+      <small>Tilt to steer · tap to spawn · drag fast to slice</small>
     </div>
   </div>
+  <div id="hint">Tilt · touch · tap · drag fast to slice · double-tap to reset</div>
 </body>
 </html>
